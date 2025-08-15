@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -166,12 +168,146 @@ func TestLoadIdentities(t *testing.T) {
 	}
 }
 
-func createBatchFile(t *testing.T, tempDir string) (string, error) {
-	batchFile := filepath.Join(tempDir, "true.cmd")
-	if err := os.WriteFile(batchFile, []byte("@echo off\nexit 0"), 0o700); err != nil {
-		return "", err
+func TestParseEditorCommand(t *testing.T) {
+	tests := []struct {
+		input        string
+		expectedCmd  string
+		expectedArgs []string
+	}{
+		// Simple command without arguments.
+		{"vi", "vi", nil},
+		// Command with one argument.
+		{"vim -n", "vim", []string{"-n"}},
+		// Command with multiple arguments.
+		{"code --wait --new-window", "code", []string{"--wait", "--new-window"}},
+		// Command with quoted arguments.
+		{"emacs --eval '(progn (message \"hello\"))'", "emacs", []string{"--eval", "(progn (message \"hello\"))"}},
+		// Command with double quoted arguments.
+		{"notepad.exe \"C:\\Program Files\\Editor\"", "notepad.exe", []string{"C:\\Program Files\\Editor"}},
+		// Command with mixed quotes.
+		{"editor --arg1 'value with spaces' --arg2=\"quoted value\"", "editor", []string{"--arg1", "value with spaces", "--arg2=quoted value"}},
+		// Command with escaped characters.
+		{"editor --arg=value\\ with\\ spaces", "editor", []string{"--arg=value with spaces"}},
+		// Empty string.
+		{"", "", nil},
+		// Only spaces.
+		{"   ", "", nil},
 	}
-	return batchFile, nil
+
+	for _, tt := range tests {
+		cmd, args := parseEditorCommand(tt.input)
+		if cmd != tt.expectedCmd {
+			t.Errorf("parseEditorCommand(%q) command = %q, expected %q", tt.input, cmd, tt.expectedCmd)
+		}
+		if !reflect.DeepEqual(args, tt.expectedArgs) {
+			t.Errorf("parseEditorCommand(%q) args = %v, expected %v", tt.input, args, tt.expectedArgs)
+		}
+	}
+}
+
+func createNoOpEditor(t *testing.T, tempDir string) string {
+	editorPath := filepath.Join(tempDir, "noop-editor")
+	if runtime.GOOS == "windows" {
+		editorPath += ".exe"
+	}
+
+	// Create a simple Go program that does nothing and exits successfully.
+	editorSrc := `package main
+func main() {
+	// Do nothing, just exit successfully
+}`
+
+	srcFile := filepath.Join(tempDir, "editor.go")
+	if err := os.WriteFile(srcFile, []byte(editorSrc), 0o600); err != nil {
+		t.Fatalf("failed to write editor source: %v", err)
+	}
+
+	cmd := exec.Command("go", "build", "-o", editorPath, srcFile)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to build no-op editor: %v", err)
+	}
+
+	return editorPath
+}
+
+func createModifyingEditor(t *testing.T, tempDir string) string {
+	editorPath := filepath.Join(tempDir, "modify-editor")
+	if runtime.GOOS == "windows" {
+		editorPath += ".exe"
+	}
+
+	// Create a Go program that writes "modified content" to the file passed as argument.
+	editorSrc := `package main
+import (
+	"os"
+)
+func main() {
+	if len(os.Args) < 2 {
+		os.Exit(1)
+	}
+	err := os.WriteFile(os.Args[1], []byte("modified content\n"), 0o600)
+	if err != nil {
+		os.Exit(1)
+	}
+}`
+
+	srcFile := filepath.Join(tempDir, "modify-editor.go")
+	if err := os.WriteFile(srcFile, []byte(editorSrc), 0o600); err != nil {
+		t.Fatalf("failed to write modifying editor source: %v", err)
+	}
+
+	cmd := exec.Command("go", "build", "-o", editorPath, srcFile)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to build modifying editor: %v", err)
+	}
+
+	return editorPath
+}
+
+func TestComputeFileHash(t *testing.T) {
+	// Create a temporary file for hash test.
+	content := "test content for hashing"
+	testFile, err := os.CreateTemp("", "hash-test")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(testFile.Name())
+
+	if _, err := testFile.WriteString(content); err != nil {
+		t.Fatalf("failed to write to temp file: %v", err)
+	}
+	testFile.Close()
+
+	// Compute hash.
+	hash1, err := computeFileHash(testFile.Name())
+	if err != nil {
+		t.Fatalf("computeFileHash() failed: %v", err)
+	}
+
+	// Compute hash again - should be identical.
+	hash2, err := computeFileHash(testFile.Name())
+	if err != nil {
+		t.Fatalf("computeFileHash() failed on second call: %v", err)
+	}
+
+	if !bytes.Equal(hash1, hash2) {
+		t.Error("computeFileHash() returned different hashes for same file")
+	}
+
+	// Modify the file.
+	if err := os.WriteFile(testFile.Name(), []byte(content+"modified"), 0o600); err != nil {
+		t.Fatalf("failed to modify file: %v", err)
+	}
+
+	// Compute hash of modified file.
+	hash3, err := computeFileHash(testFile.Name())
+	if err != nil {
+		t.Fatalf("computeFileHash() failed on modified file: %v", err)
+	}
+
+	if bytes.Equal(hash1, hash3) {
+		t.Error("computeFileHash() returned same hash for different file contents")
+	}
 }
 
 func TestEdit(t *testing.T) {
@@ -220,6 +356,18 @@ func TestEdit(t *testing.T) {
 			},
 			expectEditError: false,
 		},
+		{
+			name:     "no changes made",
+			readOnly: false,
+			checkFn:  nil, // Will be tested by verifying encrypted file hasn't changed.
+			expectEditError: false,
+		},
+		{
+			name:     "changes made",
+			readOnly: false,
+			checkFn:  nil, // Will be tested by verifying encrypted file was updated.
+			expectEditError: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -246,6 +394,12 @@ func TestEdit(t *testing.T) {
 				t.Fatalf("failed to encrypt file for test: %v", err)
 			}
 
+			// Get original encrypted file stats for comparison
+			originalStat, err := os.Stat(encFile.Name())
+			if err != nil {
+				t.Fatalf("failed to stat encrypted file: %v", err)
+			}
+
 			// Create a temporary directory.
 			tempDirPrefix, err := os.MkdirTemp("", "age-edit-test")
 			if err != nil {
@@ -254,13 +408,11 @@ func TestEdit(t *testing.T) {
 			defer os.RemoveAll(tempDirPrefix)
 
 			// Call edit.
-			editor := "true"
-			if runtime.GOOS == "windows" {
-				batchFile, err := createBatchFile(t, tempDirPrefix)
-				if err != nil {
-					t.Fatalf("failed to create batch file: %v", err)
-				}
-				editor = batchFile
+			var editor string
+			if tt.name == "changes made" {
+				editor = createModifyingEditor(t, tempDirPrefix)
+			} else {
+				editor = createNoOpEditor(t, tempDirPrefix)
 			}
 
 			tempDir, err := edit(idFile.Name(), encFile.Name(), tempDirPrefix, false, editor, tt.readOnly)
@@ -273,6 +425,48 @@ func TestEdit(t *testing.T) {
 
 			if tt.checkFn != nil {
 				tt.checkFn(t, tempDir)
+			}
+
+			if tt.name == "no changes made" {
+				newStat, err := os.Stat(encFile.Name())
+				if err != nil {
+					t.Fatalf("failed to stat encrypted file after edit: %v", err)
+				}
+
+				// Check if modification time changed - it should not have.
+				if !newStat.ModTime().Equal(originalStat.ModTime()) {
+					t.Errorf("encrypted file was modified even though no changes were made")
+				}
+			} else if tt.name == "changes made" {
+				newStat, err := os.Stat(encFile.Name())
+				if err != nil {
+					t.Fatalf("failed to stat encrypted file after edit: %v", err)
+				}
+
+				// Check if modification time changed - it should have.
+				if newStat.ModTime().Equal(originalStat.ModTime()) {
+					t.Errorf("encrypted file was not modified even though changes were made")
+				}
+
+				// Check if content has changed.
+				decryptedFile, err := os.CreateTemp("", "decrypted-check")
+				if err != nil {
+					t.Fatalf("failed to create temp file for decryption check: %v", err)
+				}
+				defer os.Remove(decryptedFile.Name())
+
+				if err := decryptToFile(encFile.Name(), decryptedFile.Name(), identity); err != nil {
+					t.Fatalf("failed to decrypt file for content check: %v", err)
+				}
+
+				newContent, err := os.ReadFile(decryptedFile.Name())
+				if err != nil {
+					t.Fatalf("failed to read decrypted file: %v", err)
+				}
+
+				if string(newContent) != "modified content\n" {
+					t.Errorf("expected 'modified content\\n', got %q", string(newContent))
+				}
 			}
 		})
 	}
