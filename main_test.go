@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"runtime"
 	"testing"
@@ -167,12 +168,61 @@ func TestLoadIdentities(t *testing.T) {
 	}
 }
 
-func createBatchFile(t *testing.T, tempDir string) (string, error) {
-	batchFile := filepath.Join(tempDir, "true.cmd")
-	if err := os.WriteFile(batchFile, []byte("@echo off\nexit 0"), 0o700); err != nil {
-		return "", err
+func createNoOpEditor(t *testing.T, tempDir string) string {
+	editorPath := filepath.Join(tempDir, "noop-editor")
+	if runtime.GOOS == "windows" {
+		editorPath += ".exe"
 	}
-	return batchFile, nil
+
+	editorSrc := `package main
+func main() {
+	// Do nothing, just exit successfully
+}`
+
+	srcFile := filepath.Join(tempDir, "editor.go")
+	if err := os.WriteFile(srcFile, []byte(editorSrc), 0o600); err != nil {
+		t.Fatalf("failed to write editor source: %v", err)
+	}
+
+	cmd := exec.Command("go", "build", "-o", editorPath, srcFile)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to build no-op editor: %v", err)
+	}
+
+	return editorPath
+}
+
+func createModifyingEditor(t *testing.T, tempDir string) string {
+	editorPath := filepath.Join(tempDir, "modify-editor")
+	if runtime.GOOS == "windows" {
+		editorPath += ".exe"
+	}
+
+	editorSrc := `package main
+import (
+	"os"
+)
+func main() {
+	if len(os.Args) < 2 {
+		os.Exit(1)
+	}
+	err := os.WriteFile(os.Args[1], []byte("modified content\n"), 0o600)
+	if err != nil {
+		os.Exit(1)
+	}
+}`
+
+	srcFile := filepath.Join(tempDir, "modify-editor.go")
+	if err := os.WriteFile(srcFile, []byte(editorSrc), 0o600); err != nil {
+		t.Fatalf("failed to write modifying editor source: %v", err)
+	}
+
+	cmd := exec.Command("go", "build", "-o", editorPath, srcFile)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("failed to build modifying editor: %v", err)
+	}
+
+	return editorPath
 }
 
 func TestComputeFileHash(t *testing.T) {
@@ -319,29 +369,11 @@ func TestEdit(t *testing.T) {
 			defer os.RemoveAll(tempDirPrefix)
 
 			// Call edit.
-			editor := "true"
+			var editor string
 			if tt.name == "changes made" {
-				if runtime.GOOS == "windows" {
-					modifyScript := filepath.Join(tempDirPrefix, "modify.cmd")
-					scriptContent := "@echo off\necho modified content > \"%1\"\n"
-					if err := os.WriteFile(modifyScript, []byte(scriptContent), 0o755); err != nil {
-						t.Fatalf("failed to create modify batch script: %v", err)
-					}
-					editor = modifyScript
-				} else {
-					modifyScript := filepath.Join(tempDirPrefix, "modify.sh")
-					scriptContent := "#!/bin/sh\necho 'modified content' > \"$1\"\n"
-					if err := os.WriteFile(modifyScript, []byte(scriptContent), 0o755); err != nil {
-						t.Fatalf("failed to create modify script: %v", err)
-					}
-					editor = modifyScript
-				}
-			} else if runtime.GOOS == "windows" {
-				batchFile, err := createBatchFile(t, tempDirPrefix)
-				if err != nil {
-					t.Fatalf("failed to create batch file: %v", err)
-				}
-				editor = batchFile
+				editor = createModifyingEditor(t, tempDirPrefix)
+			} else {
+				editor = createNoOpEditor(t, tempDirPrefix)
 			}
 
 			tempDir, err := edit(idFile.Name(), encFile.Name(), tempDirPrefix, false, editor, tt.readOnly)
