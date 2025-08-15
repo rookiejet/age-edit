@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -174,6 +175,52 @@ func createBatchFile(t *testing.T, tempDir string) (string, error) {
 	return batchFile, nil
 }
 
+func TestComputeFileHash(t *testing.T) {
+	// Create a temporary file for hash test.
+	content := "test content for hashing"
+	testFile, err := os.CreateTemp("", "hash-test")
+	if err != nil {
+		t.Fatalf("failed to create temp file: %v", err)
+	}
+	defer os.Remove(testFile.Name())
+
+	if _, err := testFile.WriteString(content); err != nil {
+		t.Fatalf("failed to write to temp file: %v", err)
+	}
+	testFile.Close()
+
+	// Compute hash.
+	hash1, err := computeFileHash(testFile.Name())
+	if err != nil {
+		t.Fatalf("computeFileHash() failed: %v", err)
+	}
+
+	// Compute hash again - should be identical.
+	hash2, err := computeFileHash(testFile.Name())
+	if err != nil {
+		t.Fatalf("computeFileHash() failed on second call: %v", err)
+	}
+
+	if !bytes.Equal(hash1, hash2) {
+		t.Error("computeFileHash() returned different hashes for same file")
+	}
+
+	// Modify the file.
+	if err := os.WriteFile(testFile.Name(), []byte(content+"modified"), 0o600); err != nil {
+		t.Fatalf("failed to modify file: %v", err)
+	}
+
+	// Compute hash of modified file.
+	hash3, err := computeFileHash(testFile.Name())
+	if err != nil {
+		t.Fatalf("computeFileHash() failed on modified file: %v", err)
+	}
+
+	if bytes.Equal(hash1, hash3) {
+		t.Error("computeFileHash() returned same hash for different file contents")
+	}
+}
+
 func TestEdit(t *testing.T) {
 	identity, err := age.GenerateX25519Identity()
 	if err != nil {
@@ -220,6 +267,18 @@ func TestEdit(t *testing.T) {
 			},
 			expectEditError: false,
 		},
+		{
+			name:     "no changes made",
+			readOnly: false,
+			checkFn:  nil, // Will be tested by verifying encrypted file hasn't changed.
+			expectEditError: false,
+		},
+		{
+			name:     "changes made",
+			readOnly: false,
+			checkFn:  nil, // Will be tested by verifying encrypted file was updated.
+			expectEditError: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -246,6 +305,12 @@ func TestEdit(t *testing.T) {
 				t.Fatalf("failed to encrypt file for test: %v", err)
 			}
 
+			// Get original encrypted file stats for comparison
+			originalStat, err := os.Stat(encFile.Name())
+			if err != nil {
+				t.Fatalf("failed to stat encrypted file: %v", err)
+			}
+
 			// Create a temporary directory.
 			tempDirPrefix, err := os.MkdirTemp("", "age-edit-test")
 			if err != nil {
@@ -255,7 +320,23 @@ func TestEdit(t *testing.T) {
 
 			// Call edit.
 			editor := "true"
-			if runtime.GOOS == "windows" {
+			if tt.name == "changes made" {
+				if runtime.GOOS == "windows" {
+					modifyScript := filepath.Join(tempDirPrefix, "modify.cmd")
+					scriptContent := "@echo off\necho modified content > \"%1\"\n"
+					if err := os.WriteFile(modifyScript, []byte(scriptContent), 0o755); err != nil {
+						t.Fatalf("failed to create modify batch script: %v", err)
+					}
+					editor = modifyScript
+				} else {
+					modifyScript := filepath.Join(tempDirPrefix, "modify.sh")
+					scriptContent := "#!/bin/sh\necho 'modified content' > \"$1\"\n"
+					if err := os.WriteFile(modifyScript, []byte(scriptContent), 0o755); err != nil {
+						t.Fatalf("failed to create modify script: %v", err)
+					}
+					editor = modifyScript
+				}
+			} else if runtime.GOOS == "windows" {
 				batchFile, err := createBatchFile(t, tempDirPrefix)
 				if err != nil {
 					t.Fatalf("failed to create batch file: %v", err)
@@ -273,6 +354,48 @@ func TestEdit(t *testing.T) {
 
 			if tt.checkFn != nil {
 				tt.checkFn(t, tempDir)
+			}
+
+			if tt.name == "no changes made" {
+				newStat, err := os.Stat(encFile.Name())
+				if err != nil {
+					t.Fatalf("failed to stat encrypted file after edit: %v", err)
+				}
+
+				// Check if modification time changed - it should not have.
+				if !newStat.ModTime().Equal(originalStat.ModTime()) {
+					t.Errorf("encrypted file was modified even though no changes were made")
+				}
+			} else if tt.name == "changes made" {
+				newStat, err := os.Stat(encFile.Name())
+				if err != nil {
+					t.Fatalf("failed to stat encrypted file after edit: %v", err)
+				}
+
+				// Check if modification time changed - it should have.
+				if newStat.ModTime().Equal(originalStat.ModTime()) {
+					t.Errorf("encrypted file was not modified even though changes were made")
+				}
+
+				// Check if content has changed.
+				decryptedFile, err := os.CreateTemp("", "decrypted-check")
+				if err != nil {
+					t.Fatalf("failed to create temp file for decryption check: %v", err)
+				}
+				defer os.Remove(decryptedFile.Name())
+
+				if err := decryptToFile(encFile.Name(), decryptedFile.Name(), identity); err != nil {
+					t.Fatalf("failed to decrypt file for content check: %v", err)
+				}
+
+				newContent, err := os.ReadFile(decryptedFile.Name())
+				if err != nil {
+					t.Fatalf("failed to read decrypted file: %v", err)
+				}
+
+				if string(newContent) != "modified content\n" {
+					t.Errorf("expected 'modified content\\n', got %q", string(newContent))
+				}
 			}
 		})
 	}

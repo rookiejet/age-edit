@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"io"
@@ -111,6 +112,21 @@ func randomID() string {
 	return string(buf)
 }
 
+func computeFileHash(filePath string) ([]byte, error) {
+	file, err := os.Open(filePath)
+	if err != nil {
+		return nil, err
+	}
+	defer file.Close()
+
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return nil, err
+	}
+
+	return hasher.Sum(nil), nil
+}
+
 func getRoot(path string) string {
 	return strings.TrimSuffix(path, ".age")
 }
@@ -212,10 +228,25 @@ func edit(idsPath, encPath, tempDirPrefix string, armor bool, editor string, rea
 		if err = decryptToFile(encPath, tempFile, identities...); err != nil {
 			return
 		}
+	} else {
+		file, createErr := os.Create(tempFile)
+		if createErr != nil {
+			err = createErr
+			return
+		}
+		file.Close()
 	}
 
 	if readOnly {
 		if err = os.Chmod(tempFile, fileReadOnlyPerm); err != nil {
+			return
+		}
+	}
+
+	var originalHash []byte
+	if !readOnly {
+		originalHash, err = computeFileHash(tempFile)
+		if err != nil {
 			return
 		}
 	}
@@ -229,9 +260,17 @@ func edit(idsPath, encPath, tempDirPrefix string, armor bool, editor string, rea
 	}
 
 	if !readOnly {
-		if err = encryptToFile(tempFile, encPath, armor, recipients...); err != nil {
-			err = &encryptError{err: err, tempFile: tempFile}
+		modifiedHash, hashErr := computeFileHash(tempFile)
+		if hashErr != nil {
+			err = hashErr
 			return
+		}
+
+		if !bytes.Equal(originalHash, modifiedHash) {
+			if err = encryptToFile(tempFile, encPath, armor, recipients...); err != nil {
+				err = &encryptError{err: err, tempFile: tempFile}
+				return
+			}
 		}
 	}
 
