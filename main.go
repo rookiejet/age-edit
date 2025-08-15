@@ -197,6 +197,63 @@ func loadIdentities(path string) ([]age.Identity, []age.Recipient, error) {
 	return identities, recipients, nil
 }
 
+func parseEditorCommand(editorCmd string) (string, []string) {
+	var parts []string
+	var current strings.Builder
+	inQuote := false
+	var quoteChar rune
+	escaped := false
+
+	for _, r := range editorCmd {
+		if escaped {
+			current.WriteRune(r)
+			escaped = false
+			continue
+		}
+
+		if r == '\\' && !inQuote {
+			escaped = true
+			continue
+		}
+
+		if !inQuote && (r == '"' || r == '\'') {
+			inQuote = true
+			quoteChar = r
+			continue
+		}
+
+		if inQuote && r == quoteChar {
+			inQuote = false
+			continue
+		}
+
+		if !inQuote && (r == ' ' || r == '\t') {
+			if current.Len() > 0 {
+				parts = append(parts, current.String())
+				current.Reset()
+			}
+			continue
+		}
+
+		current.WriteRune(r)
+	}
+
+	if current.Len() > 0 {
+		parts = append(parts, current.String())
+	}
+
+	if len(parts) == 0 {
+		return "", nil
+	}
+
+	args := parts[1:]
+	if len(args) == 0 {
+		args = nil
+	}
+
+	return parts[0], args
+}
+
 func edit(idsPath, encPath, tempDirPrefix string, armor bool, editor string, readOnly bool) (tempDir string, err error) {
 	var exists bool
 	exists, err = checkAccess(encPath, readOnly)
@@ -251,7 +308,11 @@ func edit(idsPath, encPath, tempDirPrefix string, armor bool, editor string, rea
 		}
 	}
 
-	cmd := exec.Command(editor, tempFile)
+	editorName, editorArgs := parseEditorCommand(editor)
+
+	args := append(editorArgs, tempFile)
+
+	cmd := exec.Command(editorName, args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
